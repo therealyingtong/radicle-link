@@ -3,7 +3,19 @@
 // This file is part of radicle-link, distributed under the GPLv3 with Radicle
 // Linking Exception. For full terms see the included LICENSE file.
 
-use librad::identities::payload;
+use std::{convert::TryFrom, time::Duration};
+
+use futures::StreamExt;
+
+use librad::{
+    git::{identities, tracking},
+    git_ext::RefLike,
+    identities::payload,
+    net::protocol::{
+        event::{self, upstream::predicate::gossip_from},
+        gossip,
+    },
+};
 use librad_test::{
     logging,
     rad::{identities::TestProject, testnet},
@@ -14,7 +26,7 @@ async fn saturate_a_peer_with_projects() {
     logging::init();
 
     const NUM_PEERS: usize = 2;
-    const NUM_PROJECTS: usize = 11;
+    const NUM_PROJECTS: usize = 15;
 
     let peers = testnet::setup(NUM_PEERS).await.unwrap();
     testnet::run_on_testnet(peers, NUM_PEERS, |mut peers| async move {
@@ -46,10 +58,62 @@ async fn saturate_a_peer_with_projects() {
             .await
             .unwrap()
             .unwrap();
+        peer2
+            .using_storage({
+                let remote = peer1.peer_id();
+                let urns = projs
+                    .iter()
+                    .map(|proj| proj.project.urn())
+                    .collect::<Vec<_>>();
+                move |storage| -> Result<(), anyhow::Error> {
+                    for urn in urns {
+                        tracking::track(storage, &urn, remote)?;
+                    }
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap();
 
         for proj in projs.iter() {
-            proj.pull(&peer1, &peer2).await.ok().unwrap();
+            let branch = RefLike::try_from(
+                proj.project
+                    .subject()
+                    .default_branch
+                    .as_ref()
+                    .unwrap()
+                    .as_str(),
+            )
+            .unwrap();
+            peer1
+                .announce(gossip::Payload {
+                    origin: None,
+                    urn: proj.project.urn().with_path(branch.clone()),
+                    rev: None,
+                })
+                .unwrap();
+
+            let peer2_events = peer2.subscribe();
+            event::upstream::expect(
+                peer2_events.boxed(),
+                gossip_from(peer1.peer_id()),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
         }
+
+        let n_projects = peer2
+            .using_storage(move |storage| -> Result<usize, anyhow::Error> {
+                Ok(identities::any::list(&storage)?
+                    .filter_map(|some| some.unwrap().project())
+                    .count())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n_projects, NUM_PROJECTS);
     })
     .await;
 }
